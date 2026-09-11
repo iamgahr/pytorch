@@ -4,6 +4,7 @@ import io
 import logging
 import os
 import pickle
+import sys
 import tempfile
 import types
 from collections.abc import Callable, Sequence
@@ -147,19 +148,23 @@ class AOTCompilePickler(FunctionPicklerBase):
                 return reduced
         elif inspect.isfunction(obj) and not self._fqn_resolves(obj):
             # The runtime env has to RUN this function, so unlike the guard
-            # pickler nothing it holds is pruned -- except __doc__ and __dict__
-            # entries that will not pickle. The runtime assigns those back and
-            # never forces the pruned ones, so a value this pickler cannot
-            # serialize (a __dict__ entry like the __wrapped__ functools.wraps
-            # stashes, which can drag an unrelated lock/Module in) is dropped
-            # rather than left to fail the whole dump.
+            # pickler nothing it holds is pruned -- except annotations, __doc__,
+            # and __dict__ entries that will not pickle. The runtime assigns
+            # those back and never forces the pruned ones, so a value this
+            # pickler cannot serialize (a <locals> annotation class, or a
+            # __dict__ entry like the __wrapped__ functools.wraps stashes, which
+            # can drag an unrelated lock/Module in) is dropped rather than left
+            # to fail the whole dump. Known limitation: the top-level function's
+            # own annotations ride on CompileArtifacts.signature, which
+            # serialize() dumps unpruned, so this only protects the nested
+            # functions reached here.
             return self._reduce_function(
                 obj,
                 defaults=obj.__defaults__,
                 kwdefaults=obj.__kwdefaults__,
                 closure=obj.__closure__,
                 attributes=self._pickleable_attributes(obj),
-                annotations={},
+                annotations=self._pickleable_annotations(obj),
                 doc=self._pickleable_doc(obj),
                 type_params=None,
                 globals_snapshot=None,
@@ -292,6 +297,30 @@ class AOTCompilePickler(FunctionPicklerBase):
             state.parked.clear()
             state.leaned = False
         return result
+
+    def _pickleable_annotations(self, obj: Any) -> dict[str, Any]:
+        # The runtime must SERIALIZE these, so on 3.14 ask for evaluated VALUEs
+        # rather than the FORWARDREF proxies the guard pickler reads: a proxy
+        # must not be carried (it holds its owner and may drag the owner's
+        # globals along). When they cannot be evaluated -- a TYPE_CHECKING-only
+        # name is the common case -- the whole set is dropped, with a debug log.
+        # Below 3.14 __annotations__ is read as is (never mutated: the kept
+        # values go into a fresh dict). A value can still be unpicklable -- a
+        # <locals> class resolves fine yet pickle cannot reference it -- so
+        # probe each and keep only the ones that dump.
+        if sys.version_info >= (3, 14):
+            import annotationlib
+
+            try:
+                annotations = annotationlib.get_annotations(
+                    obj, format=annotationlib.Format.VALUE
+                )
+            except Exception as e:
+                log.debug("dropping the annotations of %s: %s", obj, e)
+                return {}
+        else:
+            annotations = obj.__annotations__
+        return {k: v for k, v in annotations.items() if self._dumps_cleanly(v)}
 
 
 class AOTCompileUnpickler(pickle.Unpickler):
