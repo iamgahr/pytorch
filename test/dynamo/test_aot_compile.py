@@ -775,6 +775,87 @@ class TestAOTCompile(torch._inductor.test_case.TestCase):
         (cell,) = loaded._artifacts.runtime_env.closure
         self.assertEqual(cell.cell_contents.__dict__, {"tag": 2.0})
 
+    def test_save_guidance_when_a_closure_cell_cannot_pickle(self):
+        # A closure cell of the compiled function itself, which the artifact
+        # carries unpruned (the nested `unused` only exists to make `lock` a free
+        # variable of fn), holds a threading.Lock. save preserves the
+        # original error (callers/tests match on "cannot pickle") and appends
+        # guidance pointing at external_data, rather than reconstructing the
+        # exception (a TypeError subclass may take a non-message constructor).
+        def outer():
+            lock = threading.Lock()
+
+            def fn(x):
+                def unused():
+                    return lock
+
+                return x + 1
+
+            return fn
+
+        fn = outer()
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="aot_eager")
+        compiled_fn = compiled_fn.aot_compile(((torch.randn(3),), {}))
+        with self.assertRaises((TypeError, pickle.PicklingError)) as cm:
+            compiled_fn.save_compiled_function(self.path())
+        msg = str(cm.exception)
+        self.assertIn("cannot pickle", msg)
+        self.assertIn("not picklable", msg)
+        self.assertIn("external_data", msg)
+
+    def test_save_guidance_when_a_locals_class_default_cannot_pickle(self):
+        # A <locals> class instance in __defaults__ rides unpruned and pickle
+        # rejects it. The C pickler AOTCompilePickler subclasses raises
+        # AttributeError "Can't get local object" (3.13 and earlier) or
+        # PicklingError "Can't pickle local object" (3.14+); serialize() catches
+        # both, and the shared "local object" substring is asserted so the test
+        # does not pin one version's wording. It gets the external_data guidance
+        # appended.
+        def outer():
+            class Cfg:
+                def __init__(self):
+                    self.v = 1
+
+            def fn(x, cfg=Cfg()):
+                return x + 1
+
+            return fn
+
+        fn = outer()
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="aot_eager")
+        compiled_fn = compiled_fn.aot_compile(((torch.randn(3),), {}))
+        with self.assertRaises((AttributeError, pickle.PicklingError, TypeError)) as cm:
+            compiled_fn.save_compiled_function(self.path())
+        msg = str(cm.exception)
+        self.assertIn("local object", msg)
+        self.assertIn("not picklable", msg)
+        self.assertIn("external_data", msg)
+
+    def test_save_fails_loudly_on_a_helpers_unpicklable_kwdefault(self):
+        # The BC break: a nested helper's __kwdefaults__ now travel with it (the
+        # helper must be a local here so fn closes over it and it rides in the
+        # runtime env), so an unpicklable keyword default fails the save with
+        # guidance instead of being dropped.
+        def outer():
+            def helper(x, *, lock=threading.Lock()):
+                return x * 2
+
+            return helper
+
+        helper = outer()
+
+        def fn(x):
+            return helper(x) + 1
+
+        compiled_fn = torch.compile(fn, fullgraph=True, backend="aot_eager")
+        compiled_fn = compiled_fn.aot_compile(((torch.randn(3),), {}))
+        with self.assertRaises((TypeError, pickle.PicklingError)) as cm:
+            compiled_fn.save_compiled_function(self.path())
+        msg = str(cm.exception)
+        self.assertIn("cannot pickle", msg)
+        self.assertIn("kwdefault", msg)
+        self.assertIn("external_data", msg)
+
     def test_aot_compile_prunes_a_lock_behind_functools_wraps_wrapped(self):
         # functools.wraps writes __wrapped__ into the wrapper's __dict__ and
         # copies the wrappee's __dict__ too, so a helper that merely decorates
