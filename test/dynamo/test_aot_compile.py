@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import types
+import typing
 import unittest
 from collections import namedtuple
 from collections.abc import Callable
@@ -51,6 +52,7 @@ from torch.utils.checkpoint import checkpoint
 MY_LAMBDA = lambda x: x + 1  # noqa: E731
 
 EPS = torch.tensor(1e-7)
+AOT_TEST_TYPEVAR = typing.TypeVar("AOT_TEST_TYPEVAR")
 
 
 def aot_eager_regional_inductor():
@@ -2245,6 +2247,77 @@ class TestAOTCompilePickler(torch._inductor.test_case.TestCase):
         out = AOTCompileUnpickler({}, io.BytesIO(buf.getvalue())).load()
         self.assertEqual(out.__annotations__, {"y": int, "return": int})
         self.assertEqual(out(object(), 5), 5)
+
+    @unittest.skipIf(sys.version_info < (3, 12), "PEP 695 type params are 3.12+")
+    def test_pickler_keeps_picklable_type_params(self):
+        # __type_params__ is carried when its elements pickle: a module-level
+        # TypeVar pickles by reference, so a helper handed one reloads with the
+        # same object (a rebuild from the code object alone gives ()).
+        from torch._dynamo.aot_compile import AOTCompilePickler, AOTCompileUnpickler
+
+        def outer():
+            def inner(x):
+                return x
+
+            inner.__type_params__ = (AOT_TEST_TYPEVAR,)
+            return inner
+
+        fn = outer()
+        buf = io.BytesIO()
+        AOTCompilePickler({}, buf).dump(fn)
+        out = AOTCompileUnpickler({}, io.BytesIO(buf.getvalue())).load()
+        self.assertIs(out.__type_params__[0], AOT_TEST_TYPEVAR)
+        self.assertEqual(out(5), 5)
+
+    @unittest.skipIf(sys.version_info < (3, 12), "PEP 695 type params are 3.12+")
+    def test_pickler_keeps_pep695_type_params_given_as_external_data(self):
+        # The realistic kept case: a PEP 695 TypeVar never pickles on its own,
+        # but handed over as external data it is written by reference (the
+        # probe pickler shares external_data), so the generic reloads with its
+        # type params and annotations intact.
+        from torch._dynamo.aot_compile import AOTCompilePickler, AOTCompileUnpickler
+
+        ns = {"__name__": __name__}
+        exec(
+            "def outer():\n"
+            "    def inner[T](x: T) -> T:\n"
+            "        return x\n"
+            "    return inner\n",
+            ns,
+        )
+        fn = ns["outer"]()
+        (tv,) = fn.__type_params__
+        buf = io.BytesIO()
+        AOTCompilePickler({"T": tv}, buf).dump(fn)
+        out = AOTCompileUnpickler({"T": tv}, io.BytesIO(buf.getvalue())).load()
+        self.assertIs(out.__type_params__[0], tv)
+        self.assertEqual(out.__annotations__, {"x": tv, "return": tv})
+        self.assertEqual(out(5), 5)
+
+    @unittest.skipIf(sys.version_info < (3, 12), "PEP 695 type params are 3.12+")
+    def test_pickler_drops_unpicklable_type_params(self):
+        # A PEP 695 function-scoped TypeVar pickles by name as typing.T and
+        # fails pickle's identity check against it, so carrying the tuple
+        # verbatim would abort the dump. The whole __type_params__ tuple is
+        # dropped instead and the function still reloads and runs. Defined via
+        # exec so this file still parses below 3.12.
+        from torch._dynamo.aot_compile import AOTCompilePickler, AOTCompileUnpickler
+
+        ns = {"__name__": __name__}
+        exec(
+            "def outer():\n"
+            "    def inner[T](x: T) -> T:\n"
+            "        return x\n"
+            "    return inner\n",
+            ns,
+        )
+        fn = ns["outer"]()
+        buf = io.BytesIO()
+        AOTCompilePickler({}, buf).dump(fn)
+        out = AOTCompileUnpickler({}, io.BytesIO(buf.getvalue())).load()
+        self.assertEqual(out.__type_params__, ())
+        self.assertEqual(out.__annotations__, {})
+        self.assertEqual(out(5), 5)
 
     @unittest.skipIf(
         sys.version_info < (3, 14), "PEP 649 FORWARDREF annotations are 3.14+"
