@@ -30,7 +30,6 @@ struct TriangularSolveParams {
   uint32_t n; // triangular dimension (A is n x n)
   uint32_t k; // number of independent RHS vectors per batch
   uint32_t upper; // A is upper-triangular (before op)
-  uint32_t left; // 1: op(A) X = B, 0: X op(A) = B
   uint32_t transpose; // op transposes A
   uint32_t conj; // op conjugates A (adjoint when combined with transpose)
   uint32_t unit; // unit (implicit 1) diagonal
